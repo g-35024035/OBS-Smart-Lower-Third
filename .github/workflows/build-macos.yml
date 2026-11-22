@@ -1,0 +1,132 @@
+name: Build OBS 33 macOS Apple Silicon
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-macos.yml'
+      - '*OBS33*source*.zip'
+
+jobs:
+  build-macos:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare official OBS plugin template
+        run: git clone --depth 1 https://github.com/obsproject/obs-plugintemplate.git plugin-build
+
+      - name: Extract existing source and configure macOS build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, zipfile, pathlib
+          zips=glob.glob('*OBS33*source*.zip')
+          if not zips: raise SystemExit('OBS33 source ZIP not found')
+          with zipfile.ZipFile(zips[0]) as z:
+              source=next((n for n in z.namelist() if n.endswith('/src/plugin.cpp')),None)
+              if not source: raise SystemExit('src/plugin.cpp not found')
+              cpp=z.read(source).decode('utf-8')
+          before='    obs_source_release(source);\n    QMessageBox::information(this,"Source ready"'
+          after='''    obs_source_t *currentSceneSource = obs_frontend_get_current_scene();
+              if (currentSceneSource) {
+                obs_scene_t *currentScene = obs_scene_from_source(currentSceneSource);
+                if (currentScene && !obs_scene_find_source(currentScene, "Smart Lower Third")) {
+                  obs_scene_add(currentScene, source);
+                }
+                obs_source_release(currentSceneSource);
+              }
+              obs_source_release(source);
+              QMessageBox::information(this,"Source ready"'''
+          cpp=cpp.replace('\r\n','\n')
+          if before not in cpp: raise SystemExit('Source lifecycle patch location not found')
+          pathlib.Path('plugin-build/src/plugin.cpp').write_text(cpp.replace(before,after),encoding='utf-8')
+          PY
+          cat > plugin-build/CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.28...3.30)
+          include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
+          project(${_name} VERSION ${_version} LANGUAGES C CXX)
+          include(compilerconfig)
+          include(defaults)
+          include(helpers)
+          set(CMAKE_CXX_STANDARD 17)
+          add_library(${CMAKE_PROJECT_NAME} MODULE src/plugin.cpp)
+          find_package(libobs REQUIRED)
+          find_package(obs-frontend-api REQUIRED)
+          find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
+          target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs OBS::obs-frontend-api Qt6::Core Qt6::Gui Qt6::Widgets)
+          set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES AUTOMOC ON)
+          set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+          CMAKE
+
+      - name: Match OBS 33.0.3 macOS dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,urllib.request,hashlib,pathlib
+          version='33.0.3'
+          base='https://raw.githubusercontent.com/obsproject/obs-studio/'+version+'/CMakePresets.json'
+          presets=json.load(urllib.request.urlopen(base))
+          deps=next(p for p in presets['configurePresets'] if p['name']=='dependencies')['vendor']['obsproject.com/obs-studio']['dependencies']
+          obsurl='https://github.com/obsproject/obs-studio/archive/refs/tags/'+version+'.tar.gz'
+          with urllib.request.urlopen(obsurl) as f: digest=hashlib.sha256(f.read()).hexdigest()
+          spec={
+            'name':'obs-smart-lower-third','displayName':'OBS Smart Lower Third Manager',
+            'version':'1.0.0','author':'SKIP1',
+            'website':'https://github.com/g-35024035/OBS-Smart-Lower-Third',
+            'email':'noreply@example.invalid',
+            'platformConfig':{'macos':{'bundleId':'my.skip1.smartlowerthird'}},
+            'dependencies':{
+              'obs-studio':{'version':version,'baseUrl':'https://github.com/obsproject/obs-studio/archive/refs/tags','label':'OBS source','hashes':{'macos':digest}},
+              'prebuilt':{'version':deps['prebuilt']['version'],'baseUrl':deps['prebuilt']['baseUrl'],'label':'OBS dependencies','hashes':{'macos':deps['prebuilt']['hashes']['macos-universal']}},
+              'qt6':{'version':deps['qt6']['version'],'baseUrl':deps['qt6']['baseUrl'],'label':'OBS Qt6','hashes':{'macos':deps['qt6']['hashes']['macos-universal']}}
+            }
+          }
+          root=pathlib.Path('plugin-build')
+          (root/'buildspec.json').write_text(json.dumps(spec,indent=2))
+          path=root/'CMakePresets.json'; p=json.loads(path.read_text())
+          template=next(x for x in p['configurePresets'] if x['name']=='template')
+          template['cacheVariables'].update(ENABLE_FRONTEND_API=True,ENABLE_QT=True)
+          mac=next(x for x in p['configurePresets'] if x['name']=='macos')
+          mac['cacheVariables']['CMAKE_OSX_ARCHITECTURES']='arm64'
+          path.write_text(json.dumps(p,indent=2))
+          PY
+
+      - name: Build native Apple Silicon plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd plugin-build
+          cmake --preset macos
+          cmake --build build_macos --config Release --parallel 4
+
+      - name: Package macOS plugin bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package
+          bundle=$(find plugin-build/build_macos -type d -name 'obs-smart-lower-third.plugin' -print -quit)
+          if [ -z "$bundle" ]; then
+            echo 'No .plugin bundle found; cannot publish an incomplete plugin'
+            exit 1
+          fi
+          ditto "$bundle" "package/obs-smart-lower-third.plugin"
+          cat > package/INSTALL.txt <<'TXT'
+          OBS Studio macOS Apple Silicon TEST BUILD
+          1. Quit OBS completely.
+          2. In Finder, Go > Go to Folder:
+             ~/Library/Application Support/obs-studio/plugins
+          3. Create the plugins folder if it does not exist.
+          4. Copy obs-smart-lower-third.plugin into that folder.
+          5. Reopen OBS and check Docks > Smart Lower Third Manager.
+          This build is not signed/notarized and has not been tested on your Mac.
+          If macOS blocks it, do not bypass security warnings blindly.
+          TXT
+      - name: Upload macOS plugin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OBS-Smart-Lower-Third-macOS-Apple-Silicon
+          path: package/
+          if-no-files-found: error
