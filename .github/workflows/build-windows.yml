@@ -1,0 +1,134 @@
+name: Build OBS 33 Windows x64
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-windows.yml', '*.zip']
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare official OBS plugin build scaffold
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/obsproject/obs-plugintemplate.git plugin-build
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot clone OBS plugin template' }
+
+      - name: Extract original source and apply OBS scene lifecycle fix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Get-ChildItem -File -Filter '*OBS33*source*.zip' | Select-Object -First 1
+          if (-not $zip) { throw 'Uploaded OBS33 source ZIP not found in repository root' }
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath extracted -Force
+          $source = Get-ChildItem -Path extracted -Recurse -File -Filter plugin.cpp | Select-Object -First 1
+          if (-not $source) { throw 'plugin.cpp not found in uploaded ZIP' }
+          Copy-Item $source.FullName plugin-build/src/plugin.cpp -Force
+          $file = 'plugin-build/src/plugin.cpp'
+          $cpp = Get-Content -LiteralPath $file -Raw
+          $before = '    obs_source_release(source);' + "`n" + '    QMessageBox::information(this,"Source ready"'
+          $after = @'
+          obs_source_t *currentSceneSource = obs_frontend_get_current_scene();
+          if (currentSceneSource) {
+            obs_scene_t *currentScene = obs_scene_from_source(currentSceneSource);
+            if (currentScene && !obs_scene_find_source(currentScene, "Smart Lower Third")) {
+              obs_scene_add(currentScene, source);
+            }
+            obs_source_release(currentSceneSource);
+          }
+          obs_source_release(source);
+          QMessageBox::information(this,"Source ready"
+          '@
+          $after = $after.TrimStart("`r", "`n")
+          $cpp = $cpp.Replace("`r`n", "`n")
+          $before = $before.Replace("`r`n", "`n")
+          if (-not $cpp.Contains($before)) { throw 'Cannot apply source lifecycle patch: original code differs' }
+          $cpp = $cpp.Replace($before, $after.Replace("`r`n", "`n"))
+          Set-Content -LiteralPath $file -Value $cpp -Encoding utf8
+
+      - name: Match OBS 33.0.3 SDK and Qt dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = '33.0.3'
+          $presets = Invoke-RestMethod -Uri "https://raw.githubusercontent.com/obsproject/obs-studio/$v/CMakePresets.json"
+          $dependencyBlock = ($presets.configurePresets | Where-Object { $_.name -eq 'dependencies' }).vendor.'obsproject.com/obs-studio'.dependencies
+          if (-not $dependencyBlock.prebuilt -or -not $dependencyBlock.qt6) { throw 'OBS dependency metadata missing' }
+          New-Item -ItemType Directory -Path plugin-build/.deps -Force | Out-Null
+          $archive = 'plugin-build/.deps/33.0.3.zip'
+          Invoke-WebRequest -Uri "https://github.com/obsproject/obs-studio/archive/refs/tags/$v.zip" -OutFile $archive
+          $sha = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $spec = @{
+            name = 'obs-smart-lower-third'
+            displayName = 'OBS Smart Lower Third Manager'
+            version = '1.0.0'
+            author = 'SKIP1'
+            website = 'https://github.com/g-35024035/OBS-Smart-Lower-Third'
+            email = 'noreply@example.invalid'
+            platformConfig = @{ macos = @{ bundleId = 'my.skip1.smartlowerthird' } }
+            dependencies = @{
+              'obs-studio' = @{ version = $v; baseUrl = 'https://github.com/obsproject/obs-studio/archive/refs/tags'; label = 'OBS source'; hashes = @{ 'windows-x64' = $sha } }
+              prebuilt = @{ version = $dependencyBlock.prebuilt.version; baseUrl = $dependencyBlock.prebuilt.baseUrl; label = 'OBS dependencies'; hashes = @{ 'windows-x64' = $dependencyBlock.prebuilt.hashes.'windows-x64' } }
+              qt6 = @{ version = $dependencyBlock.qt6.version; baseUrl = $dependencyBlock.qt6.baseUrl; label = 'OBS Qt6'; hashes = @{ 'windows-x64' = $dependencyBlock.qt6.hashes.'windows-x64' } }
+            }
+          }
+          $spec | ConvertTo-Json -Depth 15 | Set-Content plugin-build/buildspec.json -Encoding utf8
+          $presetFile = 'plugin-build/CMakePresets.json'
+          $presetObject = Get-Content $presetFile -Raw | ConvertFrom-Json -AsHashtable
+          $template = $presetObject.configurePresets | Where-Object { $_.name -eq 'template' }
+          $template.cacheVariables.ENABLE_FRONTEND_API = $true
+          $template.cacheVariables.ENABLE_QT = $true
+          $presetObject | ConvertTo-Json -Depth 30 | Set-Content $presetFile -Encoding utf8
+          @'
+          cmake_minimum_required(VERSION 3.28...3.30)
+          include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
+          project(${_name} VERSION ${_version} LANGUAGES CXX)
+          include(compilerconfig)
+          include(defaults)
+          include(helpers)
+          set(CMAKE_CXX_STANDARD 17)
+          add_library(${CMAKE_PROJECT_NAME} MODULE src/plugin.cpp)
+          find_package(libobs REQUIRED)
+          find_package(obs-frontend-api REQUIRED)
+          find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
+          target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs OBS::obs-frontend-api Qt6::Core Qt6::Gui Qt6::Widgets)
+          set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES AUTOMOC ON)
+          set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+          '@ | Set-Content plugin-build/CMakeLists.txt -Encoding utf8
+
+      - name: Build Windows x64 plugin
+        shell: pwsh
+        run: |
+          Push-Location plugin-build
+          try {
+            cmake --preset windows-x64
+            if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+            cmake --build build_x64 --config Release --parallel 4
+            if ($LASTEXITCODE -ne 0) { throw 'C++ compile failed' }
+          } finally { Pop-Location }
+
+      - name: Package plugin DLL
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem plugin-build/build_x64 -Recurse -File -Filter obs-smart-lower-third.dll | Select-Object -First 1
+          if (-not $dll) { throw 'Compiled DLL not found' }
+          New-Item -ItemType Directory -Path package/obs-plugins/64bit -Force | Out-Null
+          Copy-Item $dll.FullName package/obs-plugins/64bit/ -Force
+          @'
+          TEST BUILD for OBS Studio 33.0.3 Windows x64.
+          Close OBS. Back up its settings and scene collections.
+          Copy the obs-plugins folder into your OBS installation directory.
+          Restart OBS; open Docks > Smart Lower Third Manager.
+          This plugin remains untested until verified on OBS 33.0.3.
+          '@ | Set-Content package/INSTALL.txt -Encoding utf8
+
+      - name: Upload compiled Windows plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: OBS-Smart-Lower-Third-OBS33-Windows-x64
+          path: package/
+          if-no-files-found: error
